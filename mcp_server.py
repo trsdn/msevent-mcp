@@ -5,6 +5,8 @@ Exposes live event data via MCP tools using FastMCP.
 """
 
 import json
+import time
+import urllib.error
 import urllib.request
 from collections import Counter
 
@@ -13,6 +15,8 @@ from fastmcp import FastMCP
 API_URL = "https://www.microsoft.com/msonecloudapi/events/cards"
 DEFAULT_LOCALE = "de-de"
 PAGE_SIZE = 100
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # seconds, doubles each retry
 
 # In-memory index: every card seen by any API call is stored here.
 # Key: (locale, event_id) -> raw card dict.
@@ -23,7 +27,7 @@ mcp = FastMCP("Microsoft Events")
 
 
 def fetch_page(locale: str, filters: str, top: int, skip: int, query: str = "") -> dict:
-    """Fetch a single page from the Microsoft Events API."""
+    """Fetch a single page from the Microsoft Events API with retry on failure."""
     payload = json.dumps({
         "locale": locale,
         "top": top,
@@ -33,17 +37,25 @@ def fetch_page(locale: str, filters: str, top: int, skip: int, query: str = "") 
         "query": query,
     }).encode("utf-8")
 
-    req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        req = urllib.request.Request(
+            API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BACKOFF * (2 ** attempt))
+    raise last_error
 
 
 def _index_cards(locale: str, cards: list[dict]):
@@ -99,14 +111,18 @@ def parse_card(card: dict) -> dict:
 def search_events(filters: str = "", query: str = "", locale: str = DEFAULT_LOCALE) -> str:
     """Search Microsoft Events with optional filters and free-text query.
 
+    IMPORTANT: Before searching, call list_filters first to discover the
+    available filter categories and their exact values. Do not guess filter
+    values — they must match exactly (e.g. "dynamics-365", not "dynamics").
+
     Args:
-        filters: Comma-separated filter string, e.g. "topic:ai,region:europe,format:digital".
-                 Available categories: topic, product, region, format, audience.
+        filters: Comma-separated filter string, e.g. "topic:ai,product:dynamics-365,format:digital".
+                 Use list_filters to get all available category:value pairs.
         query: Optional free-text search query.
         locale: API locale (default: de-de). Use en-us for English results.
 
     Returns:
-        JSON with total count and list of events.
+        JSON with total count and list of events including title, dates, location, and link.
     """
     cards, meta = fetch_all_cards(locale, filters, query=query)
     events = [parse_card(c) for c in cards]
@@ -147,13 +163,18 @@ def get_event_details(event_id: str, locale: str = DEFAULT_LOCALE) -> str:
 
 @mcp.tool()
 def list_filters(locale: str = DEFAULT_LOCALE) -> str:
-    """List all available filter categories and their values with event counts.
+    """List all available filter categories and their exact values with event counts.
+
+    Call this tool first before using search_events or get_event_stats with
+    filters. It returns the exact category:value pairs that the API accepts.
 
     Args:
         locale: API locale (default: de-de).
 
     Returns:
-        JSON with filter categories, each containing available values and counts.
+        JSON with filter categories (e.g. topic, product, format, region,
+        audience, industry, primary-language), each containing available
+        values and their event counts.
     """
     meta = fetch_page(locale, "", top=0, skip=0)
     facets = meta.get("facets", [])
@@ -178,53 +199,38 @@ def list_filters(locale: str = DEFAULT_LOCALE) -> str:
 
 @mcp.tool()
 def get_event_stats(filters: str = "", locale: str = DEFAULT_LOCALE) -> str:
-    """Get statistics about events: counts by country, format, topic, etc.
+    """Get statistics about events: counts by format, topic, product, region, etc.
+
+    Uses the API facets for fast, accurate counts (single API call).
+    Use list_filters first to discover valid filter values.
 
     Args:
         filters: Optional comma-separated filter string, e.g. "topic:ai".
+                 Use list_filters to get all available category:value pairs.
         locale: API locale (default: de-de).
 
     Returns:
         JSON with event statistics broken down by various dimensions.
     """
-    cards, meta = fetch_all_cards(locale, filters)
-    events = [parse_card(c) for c in cards]
+    meta = fetch_page(locale, filters, top=0, skip=0)
+    facets = meta.get("facets", [])
 
-    countries = Counter(e["country"] for e in events if e["country"])
-    formats = Counter(e["format"] for e in events if e["format"])
-    cities = Counter(e["city"] for e in events if e["city"])
+    categories: dict[str, list[dict]] = {}
+    for f in facets:
+        fid = f.get("id", "")
+        count = f.get("count", 0)
+        if ":" in fid:
+            cat, val = fid.split(":", 1)
+            categories.setdefault(cat, []).append({"name": val, "count": count})
 
-    # Extract filter-based stats
-    topics = Counter()
-    products = Counter()
-    regions = Counter()
-    audiences = Counter()
-    for e in events:
-        for fid in e["filter_ids"]:
-            if ":" in fid:
-                cat, val = fid.split(":", 1)
-                if cat == "topic":
-                    topics[val] += 1
-                elif cat == "product":
-                    products[val] += 1
-                elif cat == "region":
-                    regions[val] += 1
-                elif cat == "audience":
-                    audiences[val] += 1
-
-    def top_items(counter: Counter, n: int = 20) -> list[dict]:
-        return [{"name": k, "count": v} for k, v in counter.most_common(n)]
+    # Sort each category by count descending, limit to top 20
+    for cat in categories:
+        categories[cat].sort(key=lambda x: -x["count"])
+        categories[cat] = categories[cat][:20]
 
     return json.dumps({
         "total_events": meta.get("totalCount", 0),
-        "analyzed": len(events),
-        "by_country": top_items(countries),
-        "by_format": top_items(formats),
-        "by_city": top_items(cities),
-        "by_topic": top_items(topics),
-        "by_product": top_items(products),
-        "by_region": top_items(regions),
-        "by_audience": top_items(audiences),
+        "categories": categories,
     }, ensure_ascii=False, indent=2)
 
 
